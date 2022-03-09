@@ -20,11 +20,145 @@
 
 #include <pluginlib/class_list_macros.h>
 #include "flir_boson_usb/BosonCamera.h"
+#include <iostream>
 
 PLUGINLIB_EXPORT_CLASS(flir_boson_usb::BosonCamera, nodelet::Nodelet)
 
 using namespace cv;
 using namespace flir_boson_usb;
+
+// Time filter implementation
+class timeFilter {
+    public:
+        double sysTimeCov;
+        double imuTimeCov;
+        double sysTimeVectorDiffMean;
+        double imuTimeVectorDiffMean;
+        double Ppos = 1;
+        double Ppri;
+        int64_t tpos;
+        int64_t tpri;
+        int64_t timeImuPrev;
+        bool initialized = false;
+        int64_t dt_imu;
+        std::vector <int64_t> sysTimeVec;
+        std::vector <int64_t> imuTimeVec;
+
+
+        // Covariance Calc
+        bool cov_found = false;
+        int init_count = 0;
+        int init_count_max = 300;
+
+        void predict_step( int64_t timeImuCurr ) {
+            
+            // Prediction step
+            tpri = tpos + timeImuCurr - timeImuPrev;
+            Ppri = Ppos + imuTimeCov;
+
+            timeImuPrev = timeImuCurr;
+
+        }
+
+        void update_step( int64_t TimeSysCurr) {
+            
+            //Update step
+            tpos = tpri + (Ppri / (Ppri + sysTimeCov)) * (TimeSysCurr - tpri);
+            Ppos = Ppri * (1 - (Ppri / (Ppri + sysTimeCov)));
+                        
+        }
+
+        int64_t timeEstimate( ros::Time timeSysCurrRT, ros::Time timeImuCurrRT ) {
+            //int64_t timeImuCurr = static_cast<int64_t>(timeImuCurrRT.toSec());
+            //int64_t timeSysCurr = static_cast<int64_t>(timeSysCurrRT.toSec());
+            int64_t timeSysCurr = (int64_t)(timeSysCurrRT.nsec) + (int64_t)(timeSysCurrRT.sec)*1000000000;
+            int64_t timeImuCurr = (int64_t)(timeImuCurrRT.nsec) + (int64_t)(timeImuCurrRT.sec)*1000000000;
+            //std::cout << "test" << std::endl;
+            //std::cout << timeSysCurr << std::endl;
+            //std::cout << timeImuCurr << std::endl;
+            //std::cout << Ppos << std::endl;
+            //std::cout << initialized << cov_found << std::endl;
+
+
+
+            if (initialized && cov_found) {
+                
+                // Perform the prediction and update steps of the filter
+
+                predict_step( timeImuCurr );
+                update_step( timeSysCurr );
+            
+            
+            } else {
+
+                if (init_count < init_count_max) {
+
+                    // Add the to the covariance data set
+                    sysTimeVec.push_back(timeSysCurr);
+                    imuTimeVec.push_back(timeImuCurr);
+                    init_count++;
+
+                } else {
+
+                    
+
+                    // Calculate the covariances!
+                    calc_covariances( sysTimeVec, imuTimeVec );
+                    cov_found = true;
+
+                    // Initialize
+                    
+                    initialized = true;
+
+                }
+                timeImuPrev = timeImuCurr;
+                tpos = timeSysCurr;
+            }
+
+            //std::cout << tpos << std::endl;
+
+            return tpos;
+
+        }
+
+        void calc_covariances(std::vector<int64_t> sysTimeVector, std::vector<int64_t> imuTimeVector ) {
+
+            // I don't want to add any more libraries than there already are, which is why I am hand coding mean, covariance, etc.
+
+            // Initialize some sums for means
+            sysTimeVectorDiffMean = (sysTimeVector.front() - sysTimeVector.back()) / sysTimeVector.size();
+            imuTimeVectorDiffMean = (imuTimeVector.front() - imuTimeVector.back()) / imuTimeVector.size();
+
+            // Initialize Covariance values to build
+            double temp;
+            sysTimeCov = 0;
+            imuTimeCov = 0;
+
+            for (int i=0; i<sysTimeVector.size()-1; i++) {
+                
+                // Add the covariance increment to the item
+
+                temp = (sysTimeVector[i+1] - sysTimeVector[i]) - sysTimeVectorDiffMean;
+                sysTimeCov += temp * temp;
+
+                temp = (imuTimeVector[i+1] - imuTimeVector[i]) - imuTimeVectorDiffMean;
+                imuTimeCov += temp * temp;
+
+            }
+        }
+
+        void reinitialize() {
+            // Reset some values to starting states:
+            initialized = false;
+            cov_found = false;
+            init_count = 0;
+            std::vector<int64_t> imuTimeVec;
+            std::vector<int64_t> sysTimeVec;
+            
+        }
+};
+
+timeFilter tFilter;
 
 BosonCamera::BosonCamera() :
   cv_img()
@@ -328,6 +462,7 @@ bool BosonCamera::closeCamera()
 
 void BosonCamera::captureAndPublish(const ros::TimerEvent& evt)
 {
+
   Size size(640, 512);
 
   sensor_msgs::CameraInfoPtr
@@ -347,7 +482,13 @@ void BosonCamera::captureAndPublish(const ros::TimerEvent& evt)
   {
     ROS_ERROR("flir_boson_usb - VIDIOC_DQBUF error. Failed to dequeue the image buffer.");
     return;
-  }
+  }  
+
+  ros::Time sysTime = ros::Time::now();
+
+  ros::Time camTime = ros::Time(float(bufferinfo.timestamp.tv_sec) + float(bufferinfo.timestamp.tv_usec) / 1000000 );
+
+  ros::Time time_stamp = ros::Time( tFilter.timeEstimate( sysTime, camTime) * 1e-9);
 
   if (video_mode == RAW16)
   {
@@ -379,7 +520,9 @@ void BosonCamera::captureAndPublish(const ros::TimerEvent& evt)
       morphologyEx(gamma_corrected_image, top_hat_img, MORPH_TOPHAT, kernel);
 
       cv_img.image = thermal16_linear;
-      cv_img.header.stamp = ros::Time::now();
+      //cv_img.header.stamp = ros::Time::now();
+      //cv_img.header.stamp = ros::Time( float(bufferinfo.timestamp.tv_sec) + float(bufferinfo.timestamp.tv_usec) / 1000000 ) ;
+      cv_img.header.stamp = time_stamp;
       cv_img.header.frame_id = frame_id;
       cv_img.encoding = "mono8";
       pub_image = cv_img.toImageMsg();
@@ -392,7 +535,8 @@ void BosonCamera::captureAndPublish(const ros::TimerEvent& evt)
       resize(thermal16_linear, thermal16_linear_zoom, size);
 
       cv_img.image = thermal16_linear_zoom;
-      cv_img.header.stamp = ros::Time::now();
+      //cv_img.header.stamp = ros::Time::now();
+      cv_img.header.stamp = time_stamp;
       cv_img.header.frame_id = frame_id;
       cv_img.encoding = "mono8";
       pub_image = cv_img.toImageMsg();
@@ -409,11 +553,15 @@ void BosonCamera::captureAndPublish(const ros::TimerEvent& evt)
 
     cv_img.image = thermal_rgb;
     cv_img.encoding = "mono8";
-    cv_img.header.stamp = ros::Time::now();
+    //cv_img.header.stamp = ros::Time::now();
+    cv_img.header.stamp = time_stamp;
     cv_img.header.frame_id = frame_id;
     pub_image = cv_img.toImageMsg();
 
     ci->header.stamp = pub_image->header.stamp;
     image_pub.publish(pub_image, ci);
+
   }
+
+  
 }
